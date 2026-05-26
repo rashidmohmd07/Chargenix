@@ -1,0 +1,240 @@
+#include <ThingerESP32.h>
+#include <DHT.h>
+#include <Wire.h>
+#include <Adafruit_INA219.h>
+
+// ---------- THINGER CREDENTIALS ----------
+#define USERNAME "MakerMaster"
+#define DEVICE_ID "EV_CAR_MONITOR"
+#define DEVICE_CREDENTIAL "123456789"
+
+#define SSID "Pro"
+#define SSID_PASSWORD "123456789"
+
+ThingerESP32 thing(USERNAME, DEVICE_ID, DEVICE_CREDENTIAL);
+
+// ---------- HARDWARE PINS ----------
+#define DHTPIN 4
+#define DHTTYPE DHT11
+#define MQ7_PIN 34
+#define VOLT_PIN 35
+#define IR_PIN 27
+#define BUZZER_PIN 5
+#define RELAY_PIN 18   
+
+// ---------- SAFETY LIMITS ----------
+#define TEMP_LIMIT 35.0
+#define GAS_LIMIT 2400
+
+// ---------- BATTERY PARAMETERS ----------
+float batteryCapacity = 2.0;
+float soc = 0.0;
+
+// ---------- ENERGY VARIABLES ----------
+float energy_kWh = 0;
+float electricity_cost = 0;
+
+unsigned long lastSOCtime = 0;
+unsigned long lastEnergyTime = 0;
+
+DHT dht(DHTPIN, DHTTYPE);
+Adafruit_INA219 ina219;
+
+bool smoke_alert = false;
+bool temp_alert = false;
+bool manual_buzzer_state = false;
+
+// relay state tracking
+bool relay_manual = false;
+bool lastRelayState = false; 
+
+// ---------- VOLTAGE TO SOC ----------
+float voltageToSOC(float voltage)
+{
+  float soc = (voltage - 3.0) * (100.0 / (4.2 - 3.0));
+  soc = constrain(soc, 0, 100);
+  return soc;
+}
+
+// ---------- SOC FUNCTION ----------
+float calculateSOC(float currentA)
+{
+  unsigned long now = millis();
+  float dt = (now - lastSOCtime) / 3600000.0;
+  lastSOCtime = now;
+
+  float deltaSOC = (currentA * dt) / batteryCapacity * 100.0;
+
+  soc = soc + deltaSOC;
+  soc = constrain(soc, 0, 100);
+
+  return soc;
+}
+
+void setup() {
+
+  Serial.begin(115200);
+
+  thing.add_wifi(SSID, SSID_PASSWORD);
+
+  dht.begin();
+
+  if (!ina219.begin()) {
+    Serial.println("INA219 not detected");
+  }
+
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
+
+  pinMode(IR_PIN, INPUT);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  pinMode(RELAY_PIN, OUTPUT_OPEN_DRAIN);
+  digitalWrite(RELAY_PIN, HIGH);
+
+  // ---------- INITIAL SOC ----------
+  long total = 0;
+  for(int i = 0; i < 200; i++)
+  {
+    total += analogRead(VOLT_PIN);
+    delay(2);
+  }
+
+  float rawADC = total / 200.0;
+  float batteryVoltage = (rawADC / 4095.0) * 3.3 * 5.0 * 1.35;
+
+  soc = voltageToSOC(batteryVoltage);
+
+  Serial.print("Initial Voltage: ");
+  Serial.println(batteryVoltage);
+
+  Serial.print("Initial SOC: ");
+  Serial.println(soc);
+
+  lastSOCtime = millis();
+  lastEnergyTime = millis();
+
+  // ---------- MANUAL RELAY CONTROL ----------
+  thing["relay_switch"] << [](pson& in){
+    if(in.is_empty())
+      in = (digitalRead(RELAY_PIN) == LOW);
+    else{
+      relay_manual = (bool)in;
+      digitalWrite(RELAY_PIN, relay_manual ? LOW : HIGH);
+    }
+  };
+
+  // ---------- MAIN DASHBOARD ----------
+  thing["car_status"] >> [](pson& out){
+
+    long total = 0;
+    for(int i=0;i<100;i++) total += analogRead(VOLT_PIN);
+
+    float rawADC = total / 100.0;
+    float batteryVoltage = (rawADC / 4095.0) * 3.3 * 5.0 * 1.35;
+
+    float t = dht.readTemperature();
+    int gas = analogRead(MQ7_PIN);
+
+    temp_alert = (t > TEMP_LIMIT);
+    smoke_alert = (gas > GAS_LIMIT);
+
+    float currentA = ina219.getCurrent_mA() / 1000.0;
+    if(currentA < 0.01) currentA = 0;
+
+    float busVoltage = ina219.getBusVoltage_V();
+
+    // ---------- POWER ----------
+    float chargerVoltage = 4.2;
+    float powerW = chargerVoltage * currentA;
+
+    // ---------- ENERGY ----------
+    unsigned long now = millis();
+    float dt = (now - lastEnergyTime) / 3600000.0;
+    lastEnergyTime = now;
+
+    float energy = (powerW * dt) / 1000.0;
+    energy_kWh += energy;
+
+    electricity_cost = energy_kWh * 2000000.0;
+
+    // ---------- SOC ----------
+    float batterySOC = soc;
+
+    if(digitalRead(IR_PIN) == HIGH && currentA > 0.05)
+    {
+      batterySOC = calculateSOC(currentA);
+    }
+
+    // ---------- AUTO CUT OFF ----------
+    if(batterySOC >= 82.0)
+    {
+      digitalWrite(RELAY_PIN, HIGH);
+      relay_manual = false;
+    }
+
+    // ---------- RELAY STATE RESET LOGIC  ----------
+    bool currentRelayState = (digitalRead(RELAY_PIN) == LOW);
+
+    if(lastRelayState == true && currentRelayState == false)
+    {
+      energy_kWh = 0;
+      electricity_cost = 0;
+      lastEnergyTime = millis();
+    }
+
+    lastRelayState = currentRelayState;
+
+    // ---------- OUTPUT ----------
+    out["battery_voltage"] = batteryVoltage;
+    out["battery_percent"] = batterySOC;
+
+    out["temperature"] = isnan(t) ? 0 : t;
+    out["gas_level"] = gas;
+
+    out["temp_alert"] = temp_alert;
+    out["smoke_alert"] = smoke_alert;
+
+    out["path_voltage_V"] = busVoltage;
+    out["path_current_A"] = currentA;
+
+    out["power_W"] = powerW;
+    out["energy_kWh"] = energy_kWh;
+    out["cost_rs"] = electricity_cost;
+
+    out["relay_is_on"] = currentRelayState;
+    out["charging_ir"] = (digitalRead(IR_PIN) == HIGH);
+  };
+
+  // ---------- BUZZER ----------
+  thing["manual_buzzer"] << [](pson& in){
+    manual_buzzer_state = (bool)in;
+  };
+}
+
+void loop() {
+
+  thing.handle();
+
+  unsigned long currentMillis = millis();
+
+  float t = dht.readTemperature();
+  int gas = analogRead(MQ7_PIN);
+
+  temp_alert = (t > TEMP_LIMIT);
+  smoke_alert = (gas > GAS_LIMIT);
+
+  if (smoke_alert)
+    digitalWrite(BUZZER_PIN, (currentMillis / 100) % 2);
+
+  else if (temp_alert)
+    digitalWrite(BUZZER_PIN, (currentMillis / 500) % 2);
+
+  else if (manual_buzzer_state)
+    digitalWrite(BUZZER_PIN, HIGH);
+
+  else
+    digitalWrite(BUZZER_PIN, LOW);
+}
